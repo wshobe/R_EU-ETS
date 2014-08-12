@@ -3,44 +3,55 @@
 #test = dbGetQuery(con1, script)
 
 set.seed(1234)
-rm(session)
+rm(list = ls(all = TRUE)) 
 i = 1
 # set up session variables
-session = data.table(id=i)
-session$numValues = 20
-session$numHighUsers = 3
-session$numLowUsers = 3
+sessionData = fread("simValues.csv")
+session = sessionData[1]
+# session = data.table(id=i)
+# session$name = "Myopic agents,liquidity collar,reserve price"
+# session$numValues = 20
+# session$numHighUsers = 3
+# session$numLowUsers = 3
+# session$highUserCapacity = 4
+# session$lowUserCapacity = 4
+# session$highUserIntensity = 2
+# session$lowUserIntensity = 1
+# session$highUserInitBank = 1
+# session$lowUserInitBank = 2
+# session$lowUserInitCapital = 50
+# session$highUserInitCapital = 100
+# session$numPeriods = 18
+# session$initialReserve = 12
+# session$initialCapAmount = 29
+# session$capReduction = 1
+# session$reservePrice = 7
+# session$priceCap = F
+# session$highPriceLimit = ifelse(session$priceCap, 15, NA)
+# session$baseOutputPrice = 30
+# session$lowUserCostMin = 10
+# session$lowUserCostMax = 30
+# session$highUserCostMin = 0
+# session$highUserCostMax = 30
+# session$highOutputPriceProbability = 0.5
+# session$liquidityCollar = T
+# if (session$liquidityCollar) {
+#   session$triggerQuantityLowerBound = 18
+#   session$triggerQuantityUpperBound = 40
+#   session$triggerQuantityInjection = 6
+#   session$triggerQuantityReductionProportion = 0.15
+# }
 session$numSubjects = session$numLowUsers + session$numHighUsers
-session$highUserCapacity = 4
-session$lowUserCapacity = 4
-session$highUserIntensity = 2
-session$lowUserIntensity = 1
-session$highUserInitBank = 1
-session$lowUserInitBank = 2
-session$lowUserInitCapital = 50
-session$highUserInitCapital = 100
-session$numPeriods = 18
-session$initialReserve = 12
-session$initialCapAmount = 29
-session$capReduction = 1
-session$reservePrice = 7
-session$highPriceLimit = 100
-#session$liquidityCollar = T
-session$triggerQuantityLowerBound = 18
-session$triggerQuantityUpperBound = 40
-session$triggerQuantityInjection = 6
-session$triggerQuantityReductionProportion = 0.15
 attach(session)
-session$initialBank = lowUserInitBank*numLowUsers + highUserInitBank*numHighUsers
-session$fullCapacity = numLowUsers*lowUserCapacity*lowUserIntensity + numHighUsers*highUserCapacity*highUserIntensity
-session$sessionDataLength = numPeriods*numSubjects*numValues
+  session$initialBank = lowUserInitBank*numLowUsers + highUserInitBank*numHighUsers
+  session$fullCapacity = numLowUsers*lowUserCapacity*lowUserIntensity + numHighUsers*highUserCapacity*highUserIntensity
+  session$sessionDataLength = numPeriods*numSubjects*numValues
+  #
+  period = data.table(id=1:numPeriods)
+  period$outputPrice = rep(baseOutputPrice,numPeriods) + rbinom(numPeriods,1,highOutputPriceProbability)*10
+  period$cap = seq(initialCapAmount,by=-capReduction,length.out=numPeriods)
+  period$sessionID = id
 detach(session)
-#session
-#
-period = data.table(id=1:session$numPeriods)
-period$outputPrice = rep(30,session$numPeriods) + rbinom(session$numPeriods,1,0.5)*10
-period$cap = seq(session$initialCapAmount,by=-session$capReduction,length.out=session$numPeriods)
-period$sessionID = session$id
 period[,`:=`(
               auctionPrice = 0, auctionQuantitySold=0
               )]
@@ -48,7 +59,7 @@ period[id==1,`:=`(
               startingTotalBank=session$initialBank,
               startingReserve = session$initialReserve
               )]
-session$numHighPricePeriods = period[outputPrice>30,length(.SD[,outputPrice])]
+session$numHighPricePeriods = period[outputPrice>session$baseOutputPrice,length(outputPrice)]
 #
 session$totalCap = period[,sum(cap)]
 attach(session)
@@ -113,7 +124,8 @@ for (t in period$id) {     #period$id
   thisPeriod$startingReserve = currentReserve
   thisReservePrice = session$reservePrice       # Can be zero
   reserveAdjustment = 0    # No liquidity collar
-  if(session$triggerQuantityInjection >0 & t>2) {
+  # The following code implements the liquidity collar
+  if(session$liquidityCollar & t>2) {
     if (period$endingTotalBank[t-2]<session$triggerQuantityLowerBound ) {
       #Bank is small, pull permits out of the reserve
       reserveAdjustment = min(currentReserve,session$triggerQuantityInjection)
@@ -157,8 +169,8 @@ require(taRifx)    # For 'shift' function
 # This is where the upper price collar function goes
 cat(sprintf("auctionQuantity: %d\n", auctionQuantity))
 auctionPrice = t.bids$bid[auctionQuantity + 1 ]
-
-if(!is.na(auctionPrice) & auctionPrice > session$highPriceLimit ) {
+if (session$priceCap) {
+  if(!is.na(auctionPrice) & auctionPrice > session$highPriceLimit ) {
     reserveBidIndex = which(t.bids[,bid]<=session$highPriceLimit)[1]
     currentQuantityIndex = auctionQuantity + 1
     distance = reserveBidIndex - currentQuantityIndex
@@ -166,6 +178,7 @@ if(!is.na(auctionPrice) & auctionPrice > session$highPriceLimit ) {
     currentReserve = currentReserve - addIn
     cat(sprintf("Price collar: currentReserve: %d\n", currentReserve))
     auctionPrice = t.bids$bid[auctionQuantity + 1 + addIn]
+  }
 }
 #
   setkey(t.bids,id)
@@ -176,7 +189,7 @@ if(!is.na(auctionPrice) & auctionPrice > session$highPriceLimit ) {
     auctionExcessSupply=auctionQuantity - numPurchased
 # Unsold permits go into the reserve
     currentReserve = currentReserve + auctionExcessSupply
-   cat(sprintf("NA price: auctionExcessSupply: %d\n", auctionExcessSupply))
+    cat(sprintf("NA price: auctionExcessSupply: %d\n", auctionExcessSupply))
 # t.bids is sorted by value descending
     t.bids[1:numPurchased,bidAccepted:=1]
   } else {
