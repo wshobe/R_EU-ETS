@@ -7,8 +7,15 @@ rm(list = ls(all = TRUE))
 # set up session variables
 sessionData = fread("simValues.csv")
 numSessions = nrow(sessionData)
+# During testing, truncate the output tables before proceeding
+con <- dbConnect(MySQL(),user="wms5f", password="manx(0)Rose",dbname="test", host="localhost")
+dbGetQuery(con, "DELETE FROM item;")
+dbGetQuery(con, "DELETE FROM session;")
+dbGetQuery(con, "DELETE FROM period;")
+dbDisconnect(con)
+# 
 # Main session loop
-for (sessionNum in sessionData$id) {
+for (sessionNum in sessionData$id) {                #sessionData$id    for all rows in the spreadsheet
 #sessionNum=1
 #
 session = sessionData[sessionNum]
@@ -25,7 +32,7 @@ attach(session)
   period$sessionID = sessionNum
 detach(session)
 period[,`:=`(
-              auctionPrice = 0, auctionQuantitySold=0
+              auctionPrice = 0, auctionQuantitySold=0, auctionRevenue = 0
               )]
 period[periodNum==1,`:=`(
               startingTotalBank=session$initialBank,
@@ -74,6 +81,7 @@ attach(session)
   item[1:(totalCap+initialBank),dynamicProducingUnit:=1]
   session$efficientSurplus = item[dynamicProducingUnit==1,sum(value-sessionDynamicValue)]
 detach(session)
+behavior = session$behavior
 #
 #periods = sort(as.array(period[,.SD[,id]]))
 #  t.bids = item[,list(id,value,unit,periodNum)][order(-value)]
@@ -117,20 +125,23 @@ bankDemandShift = min(t.bank,session$fullCapacity-session$numSubjects)
 
   t.bids = item[.(t),list(itemID,value,unit)]
   t.bids = t.bids[order(-value)]
-#  minBidValue = session$dynamicEfficientPrice # Perfect foresight
-  minBidValue = 0 # Myopic bids
-# Allowances in the bank come off the top of allowance values
+  switch ( behavior,
+    "perfectly myopic" = {minBidValue = 0},
+    "perfect foresight" = {minBidValue = session$dynamicEfficientPrice},
+    stop("Please set a behavior.")  
+    )
+# Allowances in the bank come off the top of allowance values for all behaviors (could change this...)
 # Later, we can do this by bidder, but for now it is annonymous
-#print(t.bids[,value])
   t.bids[,bidValue:=shift(t.bids[,value],bankDemandShift,wrap=F,pad=T)]
-#print(t.bids$bidValue)
 # If bidValue is NA or lower than the dyn eff price, set it equal to dyn eff price
   t.bids[,bidValue:=ifelse(is.na(bidValue) ,minBidValue,bidValue)]
   t.bids[,bidValue:=ifelse(bidValue < minBidValue ,minBidValue,bidValue)]
-#print(t.bids$bidValue)
-  t.bids[,bid:=bidValue] 
-#print(t.bids$bid)
-  t.bids[,bid:=ifelse(unit==1,bid,NA)]  # In this simulation, there is no banking, so bid only on unit values
+#
+  switch ( behavior,
+      "perfectly myopic" = { t.bids[,bid:=ifelse(unit==1,bidValue,NA)] },     # In this simulation, there is no banking, so bid only on unit values
+      "perfect foresight" = { t.bids[,bid:=bidValue]  },                    # Bid values for all available bids
+      stop("Please set a behavior.")  
+  )  
   t.bids[,bid:=ifelse(bid>=thisReservePrice,bid,NA)]  # No bids less than the reserve price are allowed. NA is no bid
 
 #  currentPermitValue = ifelse(is.na(t.bids$value[auctionQuantity + t.bank ]),0,t.bids$value[auctionQuantity])
@@ -139,14 +150,14 @@ bankDemandShift = min(t.bank,session$fullCapacity-session$numSubjects)
 # This is where the upper price collar function goes
 #cat(sprintf("auctionQuantity: %d\n", auctionQuantity))
 auctionPrice = t.bids$bid[auctionQuantity + 1 ]
-if (session$priceCap) {
+if (session$priceCap) {                  # If price collar upper price is set; reserve price is turned off by setting it to zero.
   if(!is.na(auctionPrice) & auctionPrice > session$highPriceLimit ) {
     reserveBidIndex = which(t.bids[,bid]<=session$highPriceLimit)[1]
     currentQuantityIndex = auctionQuantity + 1
     distance = reserveBidIndex - currentQuantityIndex
     addIn = ifelse(currentReserve>=distance,distance,currentReserve)
     currentReserve = currentReserve - addIn
-    cat(sprintf("Price collar: currentReserve: %d\n", currentReserve))
+#    cat(sprintf("Price collar: currentReserve: %d\n", currentReserve))
     auctionPrice = t.bids$bid[auctionQuantity + 1 + addIn]
   }
 }
@@ -177,12 +188,17 @@ if (session$priceCap) {
     numPurchased = auctionQuantity 
   }
 #cat(sprintf("auctionPrice: %5.2f,  numPurchased: %d\n", auctionPrice,numPurchased))
+  period$auctionRevenue = auctionPrice*numPurchased
 # Production decision
   t.bids = t.bids[order(-value)]
   permitsAvailable = numPurchased + t.bank
   t.bids$unitUsed=0
-  t.bids[1:permitsAvailable,unitUsed:=unit]      # Fully myopic decision: use everything for which you have a permit
-#  t.bids[,unitUsed:=unit*ifelse(value>=session$dynamicEfficientPrice,1,0)]   # Run only units where permits are worth more than the dynamic price
+  switch ( behavior,
+    "perfectly myopic" = {t.bids[1:permitsAvailable,unitUsed:=unit]},     # Fully myopic decision: use everything for which you have a permit
+    "perfect foresight" = { t.bids[,unitUsed:=unit*ifelse(value>=session$dynamicEfficientPrice,1,0)]  }, # Run only units where permits are worth more than the dynamic price
+    stop("Please set a behavior.")  
+  )  
+      
   thisSurplus = t.bids[,sum(unitUsed*value)]
   numPermitsUsed = t.bids[,sum(unitUsed)]
   t.bank = max(0,permitsAvailable - numPermitsUsed)
@@ -202,12 +218,16 @@ if (session$priceCap) {
                 permitsUsed = numPermitsUsed
                 )]
 }
-con1 <- dbConnect(MySQL(),user="wms5f", password="manx(0)Rose",dbname="test", host="localhost")
-dbWriteTable(con1,"period",period,append=T,row.names=F)
-dbWriteTable(con1,"session",session,append=T,row.names=F)
-dbWriteTable(con1,"item",item,append=T,row.names=F)
-dbDisconnect(con1)
+period[item[unitUsed==1,list(production=sum(ifelse(unitIntensity==1,1.0,0.5))),by=periodNum],production:=i.production]
+period[item[dynamicProducingUnit==1,list(dynEffProduction=sum(ifelse(unitIntensity==1,1.0,0.5))),by=periodNum],dynEffProduction:=i.dynEffProduction]
+sessionOutput <- dbConnect(MySQL(),user="wms5f", password="manx(0)Rose",dbname="test", host="localhost")
+print(sessionNum)
+dbWriteTable(sessionOutput,"period",period,append=T,row.names=F)
+dbWriteTable(sessionOutput,"session",session,append=T,row.names=F)
+dbWriteTable(sessionOutput,"item",item,append=T,row.names=F)
+dbDisconnect(sessionOutput)
 }
 # production = item[unitUsed==1,list(production=sum(ifelse(unitIntensity==1,1.0,0.5))),by=periodNum]
 # dynamicProduction = item[dynamicProducingUnit==1,list(dynamicProduction=sum(ifelse(unitIntensity==1,1.0,0.5))),by=periodNum]
 # session$staticSurplus = item[unitUsed==1,sum(value-session$dynamicEfficientPrice)]
+
