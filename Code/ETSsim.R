@@ -13,10 +13,10 @@ dbGetQuery(con, "DELETE FROM period;")
 dbDisconnect(con)
 # 
 # Main session loop
-for (sessionNum in sessionData$id) {                #sessionData$id    for all rows in the spreadsheet
-#sessionNum=3
+for (sessionNum in 16:18) {                #sessionData$id    for all rows in the spreadsheet
+#sessionNum=18
 print(sessionNum)
-session = sessionData[sessionNum]
+session = sessionData[id==sessionNum]
 set.seed(1234)
 session$numSubjects = session$numLowUsers + session$numHighUsers
 attach(session)
@@ -85,7 +85,7 @@ thisBehavior = session$behavior
 #
 
 for (t in period$periodNum) {     #period$periodNum
-#t = 1:2
+#t = 1
   thisPeriod = copy(period[t])
   t.subject = copy(subject[periodNum==t])
   t.cap = thisPeriod$cap
@@ -108,7 +108,7 @@ for (t in period$periodNum) {     #period$periodNum
     t.subject$startingCash = t.subject$cash
 #    st.bank = t.subjects[,list(subjectID,startingBank)]
   }
-  t.subject[,lowBankBidKicker:=ifelse(startingBank<=unitIntensity*session$lowUserCapacity,1.05,0)]
+  t.subject[,lowBankBidKicker:=ifelse(startingBank<=unitIntensity*session$lowUserCapacity,1.1,1.0)]
   thisPeriod$startingReserve = currentReserve
   thisReservePrice = session$reservePrice       # Can be zero
   reserveAdjustment = 0    # No liquidity collar
@@ -132,26 +132,33 @@ for (t in period$periodNum) {     #period$periodNum
 #  t.bids = t.bids[order(-value)]
   st.bids = copy(st.bids[order(subjectID,-unitValue)])
   st.bids[,value:=unitValue]
-st.bids = merge(st.bids,t.subject[,list(subjectID,startingBank,lowBankBidKicker)],by="subjectID")
-thisBehavior = "perfect foresight"
+#thisBehavior = "perfect foresight"
 switch ( thisBehavior,
     "perfectly myopic" = {
                           minBidValue = 0
+                          t.subject[,lowBankBidKicker:=1.0]
                           st.bids[unit==0,value:=minBidValue]
                           },
     "perfect foresight" = {
-                          minBidValue = session$dynamicEfficientPrice
-                          st.bids[,value:=ifelse(unitValue<minBidValue,minBidValue,unitValue*lowBankBidKicker)]
+                t.subject[,lowBankBidKicker:=ifelse(startingBank<=unitIntensity*session$lowUserCapacity,1.1,1.0)]
+                
+                minBidValue = session$dynamicEfficientPrice
+                          st.bids[,value:=ifelse(unitValue<minBidValue,minBidValue,unitValue)]
                           # if
                           },
     stop("Please set a behavior.")  
     )
+  st.bids = merge(st.bids,t.subject[,list(subjectID,startingBank,lowBankBidKicker)],by="subjectID")
 # Allowances in the bank come off the top of allowance values for all behaviors (could change this...)
   s.bankDemandShift = t.subject[,ifelse(bank<0,0,bank)]
   for (i in 1:session$numSubjects) {
-    ifelse(s.bankDemandShift[i] < session$numValues,st.bids[subjectID==i,bidValue:=shift(st.bids[subjectID==i,value],s.bankDemandShift[i],wrap=F,pad=T)],st.bids[subjectID==i,bidValue:=NA])
+    ifelse(s.bankDemandShift[i] < session$numValues,
+                st.bids[subjectID==i,bidValue:=shift(st.bids[subjectID==i,value],s.bankDemandShift[i],wrap=F,pad=T)],
+                st.bids[subjectID==i,bidValue:=NA])
   }
-  st.bids[,bidValue:=ifelse(is.na(bidValue) ,minBidValue,bidValue)]
+  st.bids[,bidValue:=ifelse(is.na(bidValue) ,minBidValue*lowBankBidKicker,bidValue*lowBankBidKicker)]
+#debug(warnings())
+#warnings()
   st.bids[,bidValue:=ifelse(bidValue < minBidValue ,minBidValue,bidValue)]  
 #  bankDemandShift = ifelse(t.bank>session$fullCapacity,session$fullCapacity,t.bank)   # in Myopic sessions, use bank ASAP
 #  bankDemandShift = min(t.bank,session$fullCapacity)  # Not sure this is needed. 
@@ -207,7 +214,7 @@ if (is.na(auctionPrice)) {
 #    cat(sprintf("NA price: auctionExcessSupply: %d\n", auctionExcessSupply))
 # t.bids is sorted by value descending
 #    t.bids[,bidAccepted:=0]
-    t.bids[1:numPurchased,bidAccepted:=1]
+    if (numPurchased > 0) t.bids[1:numPurchased,bidAccepted:=1]
   } else {
     # first, resolve ties
     t.bids[!is.na(bid),tieKey:=ifelse(bid==auctionPrice,1,0)]
