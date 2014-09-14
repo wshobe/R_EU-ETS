@@ -1,20 +1,23 @@
 
 require(taRifx)    # For 'shift' function
+require(dplyr)
 rm(list = ls(all = TRUE)) 
 #i = 1
 # set up session variables
 sessionData = fread("simValues2.csv")
 numSessions = nrow(sessionData)
 # During testing, truncate the output tables before proceeding
-con <- dbConnect(MySQL(),user="wms5f", password="manx(0)Rose",dbname="test", host="localhost")
-dbGetQuery(con, "DELETE FROM item;")
-dbGetQuery(con, "DELETE FROM session;")
-dbGetQuery(con, "DELETE FROM period;")
+#con <- dbConnect(MySQL(),user="wms5f", password="manx(0)Rose",dbname="test", host="localhost")
+con <- dbConnect("PostgreSQL",user="wms5f", password="starLiner5",dbname="eu_experiments", host="localhost")
+#dbGetQuery(con, "DELETE FROM sim_item;")
+#dbGetQuery(con, "DELETE FROM sim_session;")
+#dbGetQuery(con, "DELETE FROM sim_period;")
 dbDisconnect(con)
 # 
 # Main session loop
-for (sessionNum in 16:18) {                #sessionData$id    for all rows in the spreadsheet
-#sessionNum=18
+bidKicker = 1.1
+#for (sessionNum in 13:18) {                #sessionData$id    for all rows in the spreadsheet
+sessionNum=18
 print(sessionNum)
 session = sessionData[id==sessionNum]
 set.seed(1234)
@@ -26,8 +29,10 @@ attach(session)
   #
   period = data.table(periodNum=1:numPeriods,key="periodNum")
   period$outputPrice = rep(baseOutputPrice,numPeriods) + rbinom(numPeriods,1,highOutputPriceProbability)*10
+  period$outputPrice = c(30,30,30,40,40,40,30,30,40,40,40,30,30,40,30,40,40,30)
   period$cap = seq(initialCapAmount,by=-capReduction,length.out=numPeriods)
   period$sessionID = sessionNum
+  period$treatment = treatment
 detach(session)
 period[,`:=`(
               auctionPrice = 0, auctionQuantitySold=0, auctionRevenue = 0
@@ -49,17 +54,25 @@ attach(session)
   highUnits = rep(c(rep(1,highUserCapacity*highUserIntensity),rep(0,numValues-highUserCapacity*highUserIntensity)),times=numHighUsers)
   item$unit = rep(c(lowUnits,highUnits),times=numPeriods)  #for high users each entry is a half capacity unit
   item[,unitIntensity:=rep(c(rep(lowUserIntensity,numLowUsers*numValues),rep(highUserIntensity,numHighUsers*numValues)),times=numPeriods)]
-# Assumes only 2 emission intensities
-  item[unitIntensity==lowUserIntensity,rndCostFactor:=runif(numValues*numLowUsers*numPeriods)]
-  item[unitIntensity==highUserIntensity,rndCostFactor:=rep(runif(numValues*numHighUsers*numPeriods),each=2,)]
-# Costs are for production units only, set other values in 'for t' loop
-  item[,cost:=round(unit*ifelse(unitIntensity==lowUserIntensity,(rndCostFactor*20+10),unit*(rndCostFactor*30)/unitIntensity),digits=2)]
-  setkey(item,periodNum);setkey(period,periodNum)
-  item[period,unitValue:=unit*(outputPrice/unitIntensity-cost)]
+  
   setkey(item,periodNum,subjectID,unitValue)
 # Assign unit numbers from high to low, since sorting of values is from low to high. So unit 1 has the highest value, etc.
   item[unit==1 & unitIntensity==lowUserIntensity,unitNum:=rep(lowUserCapacity:1,times=(numLowUsers*numPeriods))]
   item[unit==1 & unitIntensity==highUserIntensity,unitNum:=rep(highUserCapacity:1,each=2,times=(numHighUsers*numPeriods))]
+# Assumes only 2 emission intensities
+#  item[unitIntensity==lowUserIntensity,rndCostFactor:=runif(numValues*numLowUsers*numPeriods)]
+#  item[unitIntensity==highUserIntensity,rndCostFactor:=rep(runif(numValues*numHighUsers*numPeriods),each=2,)]
+# Costs are for production units only, set other values in 'for t' loop
+  costs = tbl(src_postgres("eu_experiments"),"items")
+  test <- costs %.%
+    select(session_id,auctionNum,subject_id,unit,cost) %.%
+    filter(!is.na(cost) ) %.%
+    arrange(session_id,auctionNum,subject_id,unit)
+  test1 = data.table(collect(test))
+  item = merge(item,test1,by=c(session_id,auctionNum,subject_id,unit),all.y=TRUE)
+item[,cost:=round(unit*ifelse(unitIntensity==lowUserIntensity,(rndCostFactor*20+10),(rndCostFactor*30)/unitIntensity),digits=2)]
+  setkey(item,periodNum);setkey(period,periodNum)
+  item[period,unitValue:=unit*(outputPrice/unitIntensity-cost)]
   item[,unitUsed:=0]
 # Set up subject data table [numSubjects*numPeriods,]
   subject = data.table(id = array(1:(numSubjects*numPeriods)),key="id") #One record per period.
@@ -108,7 +121,7 @@ for (t in period$periodNum) {     #period$periodNum
     t.subject$startingCash = t.subject$cash
 #    st.bank = t.subjects[,list(subjectID,startingBank)]
   }
-  t.subject[,lowBankBidKicker:=ifelse(startingBank<=unitIntensity*session$lowUserCapacity,1.1,1.0)]
+  t.subject[,lowBankBidKicker:=ifelse(startingBank<=unitIntensity*session$lowUserCapacity,bidKicker,1.0)]
   thisPeriod$startingReserve = currentReserve
   thisReservePrice = session$reservePrice       # Can be zero
   reserveAdjustment = 0    # No liquidity collar
@@ -140,7 +153,7 @@ switch ( thisBehavior,
                           st.bids[unit==0,value:=minBidValue]
                           },
     "perfect foresight" = {
-                t.subject[,lowBankBidKicker:=ifelse(startingBank<=unitIntensity*session$lowUserCapacity,1.1,1.0)]
+                t.subject[,lowBankBidKicker:=ifelse(startingBank<=unitIntensity*session$lowUserCapacity,bidKicker,1.0)]
                 
                 minBidValue = session$dynamicEfficientPrice
                           st.bids[,value:=ifelse(unitValue<minBidValue,minBidValue,unitValue)]
@@ -186,53 +199,53 @@ switch ( thisBehavior,
 st.bids = st.bids[order(-bid)]
 #auctionPrice = t.bids$bid[auctionQuantity + 1 ]
 auctionPrice =st.bids[order(-bid)][auctionQuantity + 1 ,bid]   # !!!!
-t.bids = copy(st.bids)         # !!!!
+#t.bids = copy(st.bids)         # !!!!
 if (session$priceCap) {                  # If price collar upper price is set; reserve price is turned off by setting it to zero.
   if(!is.na(auctionPrice) & auctionPrice > session$highPriceLimit ) {
-    reserveBidIndex = which(t.bids[,bid]<=session$highPriceLimit)[1]
+    reserveBidIndex = which(st.bids[,bid]<=session$highPriceLimit)[1]
     currentQuantityIndex = auctionQuantity + 1
     distance = reserveBidIndex - currentQuantityIndex
     addIn = ifelse(currentReserve>=distance,distance,currentReserve)
     currentReserve = currentReserve - addIn
 #    cat(sprintf("Price collar: currentReserve: %d\n", currentReserve))
     auctionQuantity = auctionQuantity+addIn
-    auctionPrice = t.bids$bid[auctionQuantity + 1 ]
+    auctionPrice = st.bids$bid[auctionQuantity + 1 ]
   }
 }
 #
 #  
-    t.bids$id=1:nrow(t.bids)
-    setkey(t.bids,id)
-    t.bids$bidAccepted=0
-    t.bids$tieKey=0
+    st.bids$id=1:nrow(st.bids)
+    setkey(st.bids,id)
+    st.bids$bidAccepted=0
+    st.bids$tieKey=0
 if (is.na(auctionPrice)) {
     auctionPrice = thisReservePrice
-    numPurchased = min(auctionQuantity,length(t.bids[!is.na(bid),bid]))
+    numPurchased = min(auctionQuantity,length(st.bids[!is.na(bid),bid]))
     auctionExcessSupply=auctionQuantity - numPurchased
 # Unsold permits go into the reserve
     currentReserve = currentReserve + auctionExcessSupply
 #    cat(sprintf("NA price: auctionExcessSupply: %d\n", auctionExcessSupply))
-# t.bids is sorted by value descending
-#    t.bids[,bidAccepted:=0]
-    if (numPurchased > 0) t.bids[1:numPurchased,bidAccepted:=1]
+# st.bids is sorted by value descending
+#    st.bids[,bidAccepted:=0]
+    if (numPurchased > 0) st.bids[1:numPurchased,bidAccepted:=1]
   } else {
     # first, resolve ties
-    t.bids[!is.na(bid),tieKey:=ifelse(bid==auctionPrice,1,0)]
-    tieLength = as.numeric(t.bids[,sum(tieKey)])
+    st.bids[!is.na(bid),tieKey:=ifelse(bid==auctionPrice,1,0)]
+    tieLength = as.numeric(st.bids[,sum(tieKey)])
     if (tieLength>1) {          #     & 
-      t.bids[!is.na(bid),bidAccepted:=ifelse(bid>auctionPrice,1,0)]
-      numNeeded = auctionQuantity-nrow(t.bids[bid>auctionPrice])
-      idArray = data.table(itemID=sample(t.bids[tieKey==1,itemID],numNeeded,replace=F),key="itemID")
-      setkey(t.bids,itemID)
-      t.bids[idArray,bidAccepted:=1]
+      st.bids[!is.na(bid),bidAccepted:=ifelse(bid>auctionPrice,1,0)]
+      numNeeded = auctionQuantity-nrow(st.bids[bid>auctionPrice])
+      idArray = data.table(itemID=sample(st.bids[tieKey==1,itemID],numNeeded,replace=F),key="itemID")
+      setkey(st.bids,itemID)
+      st.bids[idArray,bidAccepted:=1]
     } else {
-      t.bids[!is.na(bid),bidAccepted:=ifelse(bid>=auctionPrice,1,0)]
+      st.bids[!is.na(bid),bidAccepted:=ifelse(bid>=auctionPrice,1,0)]
     }
     numPurchased = auctionQuantity 
   }
 #cat(sprintf("auctionPrice: %5.2f,  numPurchased: %d\n", auctionPrice,numPurchased))
 # Production decision
-  st.bids = copy(t.bids)             #!!!!!!!!!
+#  st.bids = copy(t.bids)             #!!!!!!!!!
 # 
 #  t.bids = t.bids[order(-value)]
   st.bids = st.bids[order(subjectID,-value)]
@@ -311,9 +324,9 @@ if (is.na(auctionPrice)) {
   period[item[dynamicProducingUnit==1,list(dynEffProduction=sum(ifelse(unitIntensity==1,1.0,0.5))),by=periodNum],dynEffProduction:=i.dynEffProduction]
   session$actualSurplus = item[,sum(unitUsed*(unitValue-session$dynamicEfficientPrice))]
   sessionOutput <- dbConnect(MySQL(),user="wms5f", password="manx(0)Rose",dbname="test", host="localhost")
-  dbWriteTable(sessionOutput,"period",period,append=T,row.names=F)
-  dbWriteTable(sessionOutput,"session",session,append=T,row.names=F)
-  dbWriteTable(sessionOutput,"item",item,append=T,row.names=F)
+  dbWriteTable(sessionOutput,"sim_period",period,append=T,row.names=F)
+  dbWriteTable(sessionOutput,"sim_session",session,append=T,row.names=F)
+  dbWriteTable(sessionOutput,"sim_item",item,append=T,row.names=F)
   dbDisconnect(sessionOutput)
 
  }
