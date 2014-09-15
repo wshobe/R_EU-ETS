@@ -8,42 +8,47 @@ theme_update(axis.title.y=element_text(size=16,face="bold",angle=90),
         strip.text=element_text(size=16)
         )
 # Read in MySQL data tables ----
-experimentsDB <- dbConnect(MySQL(),user="root", password="",dbname="Experiments", host="localhost")
-bids <- mysqlReadTable(experimentsDB, "v_bids", row.names = FALSE)
-units <- mysqlReadTable(experimentsDB, "v_units", row.names = FALSE)
-auctionItems <- mysqlReadTable(experimentsDB, "v_auctionitems", row.names = FALSE)
-auctions <- mysqlReadTable(experimentsDB, "v_auctions", row.names = FALSE)
-subjects <- mysqlReadTable(experimentsDB, "subjects", row.names = FALSE)
-subjects <- rename.vars(subjects,"id","subjectNum")
-sessions <- mysqlReadTable(experimentsDB, "v_sessions", row.names = FALSE)
-dbDisconnect(experimentsDB)
+library(data.table)
+library(dplyr)
+#experimentsDB <- dbConnect("PostgreSQL",user="wms5f", password="manx(0)Rose",dbname="eu_experiments", host="localhost")
+for (con in dbListConnections(PostgreSQL())) dbDisconnect(con)
+sessions = data.table(tbl(src_postgres("eu_experiments"),sql("select * from v_sessions"))%.%collect())
+auctions = tbl(src_postgres("eu_experiments"),sql("select * from v_auctions"))
+auction_items = data.table(tbl(src_postgres("eu_experiments"),sql("select * from v_auction_items"))%.%collect())
+bids <- tbl(src_postgres("eu_experiments"),sql("select * from v_bids"))
+units <- tbl(src_postgres("eu_experiments"),sql("select * from v_units"))
+subjects <- tbl(src_postgres("eu_experiments"),"subjects")
 
 # Add key variables to the session table ----
-sessions$holding_limit.f = factor(sessions$holding_limit, levels = c("tight","loose"), labels=c("Tight","Loose"))
-sessions$reserve_method.f = factor(sessions$compliance_reserve_method, levels = c("post auction","auction"), labels=c("Post auction","In auction"))
-sessions$price_method.f = factor(sessions$uniform_price_method, levels = c("highest rejected bid","lowest accepted bid"), labels=c("Highest rejected bid","Lowest accepted bid"))
-sessions$pcr_method.f = factor(sessions$pcr_method, levels = c(0,1), labels=c("Reallocated tiers","Fixed tiers"))
-sessions$sessionEfficiency = (sessions$session_net_surplus/sessions$max_net_surplus)*100
-holding_limit_levels = c("Tight","Loose"); holding_limit_names=c("Tight","Loose")
-
+library(car)
+sessions$session_efficiency = (sessions$session_net_surplus/sessions$max_net_surplus)*100
 # Auction variables ----
-temp = aggregate(units["session_top_unit"],by=list(id=units$auction_id),sum)
-auctions = merge(auctions,temp,by="id")
-var = c("s_permits_bought","s_permits_sold","s_expenditure","s_revenue","buy_quantity","sell_quantity")
-temp = aggregate(auctionItems[var],by=list(id=auctionItems$auction_id),sum, na.rm=TRUE)
-auctions = merge(auctions,temp,by="id")
-temp = aggregate(auctionItems[c("buy_price","sell_price")],by=list(id=auctionItems$auction_id),mean, na.rm=TRUE)
-auctions <- merge(auctions,temp,by="id")
-auctions <- rename.vars(auctions,"session_top_unit","session_top_units")
-auctions$low_hydro_year = auctions$output_price
-auctions$low_hydro_year.f = recode(auctions$low_hydro_year, "c(35)='Normal'; else='Low hydro'")
-auctions = merge(auctions,sessions[c("id","holding_limit.f","reserve_method.f","price_method.f","pcr_method.f","dynamic_uniform_price_prediction","session_group","sessionEfficiency")],by.x="session_id",by.y="id",all.x=TRUE)
-auctions = transform(auctions, 
-              current_trading = a_end_permits - a_compliance_carry_over,
+temp = units %.% select(auction_id,session_top_unit) %.% 
+                 group_by(auction_id) %.% 
+                 summarize(session_top_units = sum(session_top_unit)) %.%
+                 mutate(id = auction_id) %.% select(-auction_id)%.%
+                 arrange(id)
+auctions = data.table(merge(auctions,temp,by="id"))
+temp = auction_items[,list(s_permits_bought = sum(s_permits_bought),
+                    s_permits_sold = sum(s_permits_sold),
+                    s_expenditure = sum(s_expenditure),
+                    s_revenue = sum(s_revenue),
+                    buy_quantity = sum(buy_quantity),
+                    sell_quantity = sum(sell_quantity),
+                    buy_price = mean(buy_price),
+                    sell_price = mean(sell_price)), by=auction_id]
+setnames(temp, "auction_id", "id")
+setkey(temp,id); setkey(auctions,id)
+auctions <- auctions[temp]
+auctions[,output_price_level := ifelse(output_price==sessions$output_price,'low','high')]
+auctions$output_price_level.f = recode(auctions$output_price_level, "'low'='Low'; else='High'")
+temp = sessions[,list(id,dynamic_uniform_price_prediction,session_efficiency)]
+setkey(auctions,session_id); setkey(temp,id)
+auctions = auctions[temp]
+auctions[,`:=`( 
               current_total_bank = a_end_permits,
-              auctionEfficiency = (netSurplus/auctionMaxSessionSurplus)*100,
-              auctionEfficiency_diff = auctionMaxSessionSurplus-netSurplus,
-              trading_pct = ((a_end_permits - a_compliance_carry_over)/a_end_permits)*100,
+              auction_efficiency = (net_surplus/auction_max_session_surplus)*100,
+              auction_efficiency_diff = auction_max_session_surplus-net_surplus,
               dif_price_predicted = (uniform_price - uniform_price_prediction),
               dif_price_dynamic = (uniform_price - dynamic_uniform_price_prediction),
               dif_wprice_dynamic = (uniform_price_prediction - dynamic_uniform_price_prediction),
@@ -52,82 +57,93 @@ auctions = transform(auctions,
               sdif_wprice_dynamic = abs(uniform_price_prediction - dynamic_uniform_price_prediction),
               spot_price_diff = spot_price - uniform_price,
               spot_dynamic_price_diff = spot_price - dynamic_uniform_price_prediction
-              )
-auctions$max_surplus_allocation_high <- NULL
+              )]
+auctions[,max_surplus_allocation_high := NULL]
 
 # More session variables ----
-temp = aggregate(auctions[c("s_permits_sold","s_expenditure","buy_quantity","sell_quantity","netSurplus","auctionMaxSessionSurplus")],by=list(id=auctions$session_id),sum, na.rm=TRUE)
-sessions <- merge(sessions,temp,by="id")
-temp = aggregate(auctions[c("spot_price","buy_price","sell_price","current_trading","sdif_price_dynamic")],by=list(id=auctions$session_id),mean, na.rm=TRUE)
-sessions <- merge(sessions,temp,by="id")
+library(gdata)
+setkey(sessions,id)
+vars = c("s_permits_sold","s_expenditure","buy_quantity","sell_quantity","net_surplus","auction_max_session_surplus")
+temp = auctions[, lapply(.SD, sum, na.rm=TRUE), by=session_id, .SDcols=vars ][, `:=`(id=session_id,session_id=NULL)]
+setkey(temp,id)
+sessions <- sessions[temp]
+#vars = c("spot_price","buy_price","sell_price")
+#temp = auctions[, lapply(.SD, mean, na.rm=TRUE), by=session_id, .SDcols=vars ][, `:=`(id=session_id,session_id=NULL)]
+#temp = aggregate(auctions[c("spot_price","buy_price","sell_price","current_trading","sdif_price_dynamic")],by=list(id=auctions$session_id),mean, na.rm=TRUE)
+#sessions <- merge(sessions,temp,by="id")
 # Rename spot market variables to something a little more descriptive.
-spotVars_pre <- c("s_permits_sold","s_expenditure","buy_quantity","sell_quantity","buy_price","sell_price")
-spotVars_post <- c("spot_market_volume","spot_market_expenditure","spot_market_bid_volume","spot_market_offer_volume","spot_avg_bid_price","spot_avg_offer_price")
+spotVars_pre <- c("s_permits_sold","s_expenditure","buy_quantity","sell_quantity")
+spotVars_post <- c("spot_market_volume","spot_market_expenditure","spot_market_bid_volume","spot_market_offer_volume")
 auctions <- rename.vars(auctions,spotVars_pre,spotVars_post)
 sessions <- rename.vars(sessions,spotVars_pre,spotVars_post)
 
-# The auctionItems data frame ----
+# The auction_items data frame ----
+#auction_items = auction_items%.%collect()
+subjects = data.table(subjects%.%collect())
 # One observation for each auction/subject pair.
 # This allows us to build a panel of subjects who each participate in one session-sequence of 12 auctions
-units <- transform(units,
-                   actual_value = unit_value * used_unit,
-                   auction_value = unit_value * auction_top_unit,
-                   session_value = unit_value * session_top_unit)
-units <- transform(units,
-                   auction_value_diff = auction_value - actual_value,
-                   session_value_diff = session_value - actual_value ) 
-# Aggregate from the units table to the auctionItems table
+units = data.frame(units%.%collect())
+units = data.table(units,key="unit_id")
+units[,`:=`(
+            actual_value = unit_value * used_unit,
+            auction_value = unit_value * auction_top_unit,
+            session_value = unit_value * session_top_unit)]
+units[,`:=`(
+            auction_value_diff = auction_value - actual_value,
+            session_value_diff = session_value - actual_value)] 
+# Aggregate from the units table to the auction_items table
 vars= c("session_top_unit","auction_top_unit","actual_value","auction_value","session_value")
-temp = aggregate(units[vars],by=list(id=units$auction_item_id),sum, na.rm=TRUE)
-auctionItems <- merge(auctionItems,temp,by="id")
-auctionItems <- rename.vars(auctionItems,c("session_top_unit","auction_top_unit"),c("session_top_units","auction_top_units"))
-auctionItems <- merge(auctionItems,subjects[c("subjectNum","subject_id","session_id")],by=c("session_id","subject_id"),all.x=TRUE)
-auctionItems <- merge(auctionItems,sessions[c("id","holding_limit.f","reserve_method.f","price_method.f","pcr_method.f"
-                                              ,"dynamic_uniform_price_prediction")],by.x="session_id",by.y="id",all.x=TRUE)
-auctionItems <- transform(auctionItems,
-                          session_production_diff = production - session_top_units,
-                          auction_production_diff = production - auction_top_units,
-                          net_actual_value = actual_value - permits_used * dynamic_uniform_price_prediction,
-                          net_auction_value = auction_value - permits_used * dynamic_uniform_price_prediction,
-                          net_session_value = session_value - permits_used * dynamic_uniform_price_prediction
-                          )
-auctionItems$lost_value = auctionItems$net_actual_value - auctionItems$net_session_value
-auctionItems$low_hydro_year.f = recode(auctionItems$output_price,as.factor=TRUE, "c(35)='Normal'; else='Low hydro'")
-auctionItems$current_trading <- auctionItems$end_permits - auctionItems$compliance_carry_over
-auctionItems$value_dif <- auctionItems$net_session_value - auctionItems$net_actual_value
-var = c("actual_value","auction_value","session_value","net_actual_value","net_auction_value",
+temp = units[, lapply(.SD, sum, na.rm=TRUE), by=auction_item_id, .SDcols=vars ][, `:=`(id=auction_item_id,auction_item_id=NULL)]
+#temp = aggregate(units[vars],by=list(id=units$auction_item_id),sum, na.rm=TRUE)
+auction_items <- merge(auction_items,temp,by="id",all.x=TRUE)
+auction_items <- rename.vars(auction_items,c("subject_id","session_top_unit","auction_top_unit"),
+                    c("subject_num","session_top_units","auction_top_units"))
+subjects <- rename.vars(subjects,"id","subject_id")
+temp = subjects[,list(subject_num,session_id,subject_id)]
+setkey(auction_items,"session_id","subject_num")
+setkey(temp,"session_id","subject_num")
+auction_items = auction_items[temp]
+temp = sessions[,list(id,pcr_method,dynamic_uniform_price_prediction)]
+setkey(auction_items,session_id)
+auction_items = auction_items[temp]
+auction_items[,`:=`(
+                  session_production_diff = production - session_top_units,
+                  auction_production_diff = production - auction_top_units,
+                  net_actual_value = actual_value - permits_used * dynamic_uniform_price_prediction,
+                  net_auction_value = auction_value - permits_used * dynamic_uniform_price_prediction,
+                  net_session_value = session_value - permits_used * dynamic_uniform_price_prediction
+                  )]
+auction_items$lost_value = auction_items$net_actual_value - auction_items$net_session_value
+auction_items$value_dif <- auction_items$net_session_value - auction_items$net_actual_value
+vars = c("actual_value","auction_value","session_value","net_actual_value","net_auction_value",
         "net_session_value","auction_production_diff","session_production_diff","permits_used")
-temp = aggregate(auctionItems[var],by=list(id=auctionItems$auction_id),sum, na.rm=TRUE)
+temp = auction_items[, lapply(.SD, sum, na.rm=TRUE), by=auction_num, .SDcols=vars ][, `:=`(id=auction_num,auction_num=NULL)]
+#temp = aggregate(auction_items[,list(var)],by=list(id=auction_items$auction_id),sum, na.rm=TRUE)
 auctions = merge(auctions,temp,by="id")
 
 # Aggregate bid information ----
-temp = aggregate(bids["permit_number"],by=list(id=bids$auction_item_id),max, na.rm=TRUE)
-auctionItems <- merge(auctionItems,temp,by="id",all.x=TRUE)
-temp = aggregate(bids["bid"],by=list(id=bids$auction_item_id),mean, na.rm=TRUE)
-auctionItems <- merge(auctionItems,temp,by="id",all.x=TRUE)
-temp = aggregate(bids["bid_accepted"],by=list(id=bids$auction_item_id),sum, na.rm=TRUE)
-auctionItems <- merge(auctionItems,temp,by="id",all.x=TRUE)
-auctionItems <- rename.vars(auctionItems,c("permit_number","bid","bid_accepted"),c("num_bids","average_bid","num_bids_accepted"))
+bids = data.table(bids%.%collect())
+temp = bids[,list(
+    num_bids = max(permit_number,na.rm=TRUE),
+    average_bid = mean(bid,na.rm=TRUE),
+    num_bids_accepted = sum(bid_accepted,na.rm=TRUE)), 
+    by = auction_item_id][, `:=`(id=auction_item_id,auction_item_id=NULL)]
+auction_items <- merge(auction_items,temp,by="id",all.x=TRUE)
+auction_items$num_bids[is.na(auction_items$num_bids)] <- 0
 # Aggregate bid information up to the auctions and sessions level
-auctionItems$num_bids[is.na(auctionItems$num_bids)] <- 0
-temp = aggregate(auctionItems[c("num_bids","num_bids_accepted")],by=list(id=auctionItems$auction_id),sum, na.rm=TRUE)
+temp = auction_items[,list(
+  num_bids = sum(num_bids,na.rm=TRUE),
+  average_bid = mean(average_bid,na.rm=TRUE),
+  num_bids_accepted = sum(num_bids_accepted,na.rm=TRUE)), 
+  by = auction_id][, `:=`(id=auction_id,auction_id=NULL)]
 auctions <- merge(auctions,temp,by="id",all.x=TRUE)
-temp = aggregate(auctionItems["average_bid"],by=list(id=auctionItems$auction_id),mean, na.rm=TRUE)
-auctions <- merge(auctions,temp,by="id",all.x=TRUE)
-temp = aggregate(auctions[c("num_bids","num_bids_accepted")],by=list(id=auctions$session_id),sum, na.rm=TRUE)
+temp = auctions[,list(
+  num_bids=sum(num_bids,na.rm=TRUE),
+  average_bid = mean(average_bid,na.rm=TRUE),
+  num_bids_accepted = sum(num_bids_accepted,na.rm=TRUE)),
+  by = session_id][, `:=`(id=session_id,session_id=NULL)]
 sessions <- merge(sessions,temp,by="id",all.x=TRUE)
-temp = aggregate(auctions["average_bid"],by=list(id=auctions$session_id),mean, na.rm=TRUE)
-sessions <- merge(sessions,temp,by="id",all.x=TRUE)
-sessions <- within(sessions,{
-  group <- NA
-  group[pcr_method.f=="Reallocated tiers" & reserve_method.f=="Post auction"] = 1
-  group[pcr_method.f=="Fixed tiers" & reserve_method.f=="Post auction" & price_method.f=="Highest rejected bid"] = 2
-  group[pcr_method.f=="Fixed tiers" & reserve_method.f=="Post auction" & price_method.f=="Lowest accepted bid"] = 3
-#  group[pcr_method.f=="Fixed tiers" & reserve_method.f=="In auction" ] = 4  
-})
-sessions$group.f = factor(sessions$group,levels=c(1,2,3),labels=c("Loose cap","Second price","First price"))
-auctions = merge(auctions,sessions[c("id","group.f")],by.x="session_id",by.y="id",all.x=TRUE)
  
-#xtabs( ~ subjectNum + auctionNum, data=auctionItems)
+#xtabs( ~ subjectNum + auctionNum, data=auction_items)
 #xtabs( ~ session_id + auction, data=auctions)
 # End data generation
